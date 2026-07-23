@@ -3,9 +3,23 @@
 Deploy this file as a Databricks notebook or Python job on the same cluster shape and
 AWS region as production, set the widgets, and run LISTING_ONLY first. BOUNDED_DRAIN
 uses Auto Loader availableNow with foreachBatch counting; it never writes bronze data.
-Every run uses fresh schema/checkpoint directories below a required ``_measurement``
-namespace, so production tables and production Auto Loader progress remain untouched.
-Delete the run directory and optional scratch results table when measurements are done.
+
+By DEFAULT (empty ``run_id`` widget) every run uses FRESH schema/checkpoint directories
+below a required ``_measurement`` namespace, so production tables and production Auto
+Loader progress remain untouched. Because the checkpoint starts empty, that run re-reads
+the ENTIRE historical backlog: it measures COLD-START, full-history drain.
+
+To instead measure STEADY-STATE (incremental) drain — the real 24x7 loop wave — pin the
+``run_id`` widget to a stable token so RUN_ROOT (hence each per-collection schema and
+checkpoint path) is REUSED across runs:
+  (1) first run with ``run_id=my-steady-probe`` SEATS Auto Loader offsets by draining the
+      current backlog;
+  (2) WAIT a representative interval for new files to arrive;
+  (3) re-run with the SAME ``run_id=my-steady-probe`` — now ``drain_seconds``/files reflect
+      only the INCREMENTAL new files (the steady-state wave), not the full history.
+Reuse never leaves the ``_measurement/{run_id}`` namespace and still uses the count-only
+foreachBatch sink, so production tables and production checkpoints stay untouched either
+way. Delete the run directory and optional scratch results table when measurements are done.
 """
 
 # VERIFY AT DEPLOY:
@@ -42,6 +56,10 @@ dbutils.widgets.text("max_workers", "8")
 dbutils.widgets.dropdown("mode", "LISTING_ONLY", ["LISTING_ONLY", "BOUNDED_DRAIN"])
 dbutils.widgets.dropdown("write_results", "false", ["false", "true"])
 dbutils.widgets.text("results_table", "drain_measurement_results")
+# Empty (default) => a fresh RUN_ID per run (cold-start, full-history drain, unchanged
+# behavior). Set to a stable token (e.g. "my-steady-probe") to PIN/REUSE that run's seated
+# per-collection checkpoints on the next run and measure INCREMENTAL/steady-state drain.
+dbutils.widgets.text("run_id", "")
 
 CATALOG = dbutils.widgets.get("catalog").strip()
 PROD_SCHEMA = dbutils.widgets.get("schema").strip()  # context only; never written
@@ -53,7 +71,39 @@ MAX_WORKERS = int(dbutils.widgets.get("max_workers"))
 MODE = dbutils.widgets.get("mode").upper()
 WRITE_RESULTS = dbutils.widgets.get("write_results").lower() == "true"
 RESULTS_TABLE = dbutils.widgets.get("results_table").strip()
-RUN_ID = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8]
+# Read RAW (do NOT .strip()): only the LITERAL empty string means "use the default fresh
+# UUID". Any other value — including one with leading/trailing/internal whitespace — is
+# treated as provided and MUST go through _run_id_token, which rejects it (whitespace is not
+# in the allowed charset). Pre-stripping here would silently accept "  token  " as "token"
+# (RUN_ID no longer the EXACT supplied value) and turn whitespace-only "   " into the fresh
+# path instead of raising.
+RUN_ID_OVERRIDE = dbutils.widgets.get("run_id")
+
+
+def _run_id_token(value, label):
+    # A pinned run_id is embedded directly in RUN_ROOT, so it must be a conservative,
+    # single-segment path token: no separators, no '..', no whitespace. This keeps RUN_ROOT
+    # under CHECKPOINT_ROOT/MEASUREMENT_NAMESPACE (the '_measurement' SAFETY STOPs stay intact)
+    # because a run_id matching this pattern cannot contain '/' to escape the namespace. The
+    # explicit ".." substring reject also forbids tokens like "a..b" so the 'no ..' guarantee holds.
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", value) or value in {".", ".."} or ".." in value:
+        raise ValueError(
+            f"{label} must match ^[A-Za-z0-9._-]+$ with no '..' (a single safe path token, no "
+            f"separators, whitespace, or '..'): {value!r}")
+    return value
+
+
+# Empty run_id => fresh timestamp+uuid RUN_ID per run (unchanged default: cold-start, full
+# history re-read). Any non-empty run_id (including whitespace-only) => that exact value is
+# validated and REUSED, so RUN_ROOT (and the per-collection schema/checkpoint paths below it)
+# is stable across runs and the next run with the SAME run_id drains only the incremental
+# delta (steady-state wave). The raw != "" comparison ensures a whitespace-only value is
+# treated as 'provided' and hits the validator (raises), never silently the fresh path.
+REUSED_CHECKPOINT = RUN_ID_OVERRIDE != ""
+if REUSED_CHECKPOINT:
+    RUN_ID = _run_id_token(RUN_ID_OVERRIDE, "run_id")
+else:
+    RUN_ID = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8]
 
 
 def _identifier(value, label):
@@ -99,6 +149,77 @@ GROUP1 = {
         "upitransactions", "bankstatementanalyserrequests", "accountaggregatorrequests",
         "bankchangerequests", "admintransactions", "ui-elements", "subscriptions"]},
 }
+
+# ============================== ADD NEW TOPICS HERE ==============================
+# Append parent collections below WITHOUT editing the GROUP1 lists above. How to add one:
+#   * Use the BARE collection name only (e.g. "mynewcollection") — NO "refyne." prefix. The
+#     harness keys collection identity on the bare name (see PARENTS / owner_parent below),
+#     unlike the pipeline whose GROUP1 topics are "refyne.<collection>".
+#   * Put it in the tier (high / medium / low) that matches the collection's write volume; the
+#     tier sets its maxFilesPerTrigger cap (GROUP1[tier]["max_files"]) during BOUNDED_DRAIN.
+#   * Duplicates are ignored automatically (de-duped on merge; existing order preserved).
+#   * Do NOT list children — decomposed <parent>_<child> collections are auto-discovered from S3.
+# Empty by default (default-inert): with all lists empty, GROUP1, PARENTS, discovery/selection,
+# and every downstream measurement (listing, bounded drain, projection math, safety stops,
+# results) are byte-for-byte unchanged vs today — the same Consumer-1 parents and tiers.
+EXTRA_TOPICS = {
+    "high": [
+        # "myhighvolumecollection",
+    ],
+    "medium": [
+        # "mymediumvolumecollection",
+    ],
+    "low": [
+        # "mylowvolumecollection",
+    ],
+}
+
+# Merge EXTRA_TOPICS into GROUP1 deterministically and SAFELY. A collection is measured under
+# exactly ONE tier: PARENTS below is last-tier-wins, so the SAME collection placed under two
+# tiers would silently reassign its per-tier maxFilesPerTrigger cap (GROUP1[tier]["max_files"])
+# and mismeasure its drain. We therefore build ONE GLOBAL collection->tier map spanning BOTH the
+# existing GROUP1 declarations AND the EXTRA_TOPICS additions, BEFORE mutating anything.
+def _canon_topic(topic):
+    # Canonical collection identity of a topic in the harness: the bare, trimmed collection name.
+    # The harness has NO "refyne."-style prefix (topics are already bare, e.g. "transactions"),
+    # so canonical identity is just the trimmed name — consistent with how PARENTS / owner_parent
+    # key on the raw bare collection string below. No dash/underscore folding: "ui-elements" and
+    # "ui_elements" stay distinct here, exactly as PARENTS/owner_parent already treat them.
+    return topic.strip()
+
+
+# Pass 1 — VALIDATE ONLY (no mutation): fold existing declarations then the extras into one
+# collection->tier map. A collection assigned to two DIFFERENT tiers FAILS LOUD (names the
+# collection and both tiers); the SAME collection repeated under the SAME tier is fine (idempotent).
+_topic_tier = {}
+for _tier in ("high", "medium", "low"):
+    for _tp in list(GROUP1[_tier]["topics"]) + list(EXTRA_TOPICS[_tier]):
+        _coll = _canon_topic(_tp)
+        _prior = _topic_tier.get(_coll)
+        if _prior is not None and _prior != _tier:
+            raise ValueError(
+                f"collection {_coll!r} (from topic {_tp!r}) is assigned to two tiers "
+                f"({_prior!r} and {_tier!r}); a collection is measured under exactly ONE tier "
+                f"(its maxFilesPerTrigger cap) — remove the duplicate from GROUP1/EXTRA_TOPICS")
+        _topic_tier[_coll] = _tier
+
+# Pass 2 — MUTATE: append each tier's extras to that tier's topics list, de-duplicating on
+# CANONICAL COLLECTION IDENTITY (via _canon_topic, consistent with Pass 1) — NOT the raw string.
+# Seeding the seen-set from the pre-existing GROUP1 topics is also canonicalized, so an
+# EXTRA_TOPICS entry that canonically duplicates an already-declared collection in the same tier
+# is a no-op (not re-added). We append the CANONICAL bare name (not the raw string) because the
+# harness feeds GROUP1 topics straight into PARENTS/owner_parent/source_glob with no downstream
+# canonicalization — so the stored form must already be the clean bare identity. Order preserved
+# (existing topics keep their position; a new collection is appended at most once).
+for _tier, _extras in EXTRA_TOPICS.items():
+    _topics = GROUP1[_tier]["topics"]
+    _seen = {_canon_topic(t) for t in _topics}
+    for _tp in _extras:
+        _coll = _canon_topic(_tp)
+        if _coll not in _seen:
+            _topics.append(_coll)
+            _seen.add(_coll)
+
 PARENTS = {name: tier for tier, cfg in GROUP1.items() for name in cfg["topics"]}
 
 
@@ -196,6 +317,7 @@ if not selected_names:
     print("WARNING: discovery found no Consumer-1 paths; reporting parents with zero/visible listings")
 
 print(json.dumps({"run_id": RUN_ID, "mode": MODE, "run_root": RUN_ROOT,
+                  "reused_checkpoint": REUSED_CHECKPOINT,
                   "parents_configured": len(PARENTS), "collections_discovered": len(discovered),
                   **discovery}, indent=2))
 
@@ -324,7 +446,8 @@ projections = [{"max_workers": w,
                for w in (4, 6, 8, 12, 16)]
 parents_present = sum(1 for n in selected_names if n in PARENTS)
 summary = {
-    "run_id": RUN_ID, "mode": MODE, "configured_max_workers": MAX_WORKERS,
+    "run_id": RUN_ID, "mode": MODE, "reused_checkpoint": REUSED_CHECKPOINT,
+    "configured_max_workers": MAX_WORKERS,
     "parents_present": parents_present, "children_discovered": len(selected_names) - parents_present,
     "collections_measured": len(results),
     "errored_collections": sum(1 for r in results if r["status"] == "ERROR"),
