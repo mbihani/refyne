@@ -474,7 +474,12 @@ if WRITE_RESULTS:
                "discovery_seconds": discovery["discovery_seconds"]}
               for r in results]
     # JSON inference represents all-null LISTING_ONLY fields safely (createDataFrame cannot infer them).
-    output_df = spark.read.json(spark.sparkContext.parallelize([json.dumps(x) for x in output]))
+    # Build the single-column string DataFrame WITHOUT the RDD API (no spark.sparkContext /
+    # parallelize) so this stays Spark-Connect-safe (shared access mode, serverless, DBR Connect);
+    # spark.read.json still does the all-null-safe JSON string inference. Do NOT reintroduce RDD APIs.
+    json_rows = [(json.dumps(x),) for x in output]
+    output_df = spark.read.json(
+        spark.createDataFrame(json_rows, "value string").select("value"))
     (output_df.withColumn("measured_at_utc", F.to_timestamp("measured_at_utc"))
      .write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(RESULTS_FQN))
     print(f"Appended {len(output)} rows to scratch table {RESULTS_FQN}")
