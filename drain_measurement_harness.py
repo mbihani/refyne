@@ -32,7 +32,6 @@ way. Delete the run directory and optional scratch results table when measuremen
 import json
 import math
 import re
-import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -343,16 +342,6 @@ def bounded_drain(row):
     collection = row["collection"]
     safe_name = re.sub(r"[^A-Za-z0-9_]", "_", collection)
     tier = PARENTS[owner_parent(collection)]
-    batches = []
-    batch_lock = threading.Lock()
-
-    def count_batch(df, batch_id):
-        t0 = time.perf_counter()
-        count = df.count()
-        with batch_lock:
-            batches.append({"batch_id": int(batch_id), "rows": count,
-                            "seconds": time.perf_counter() - t0})
-
     query = None
     result = None
     try:
@@ -368,14 +357,22 @@ def bounded_drain(row):
             reader = reader.option("header", "true")
         df = reader.load(source_glob(collection, row["format"]))
         query = (df.writeStream.queryName(f"measure_{safe_name}_{RUN_ID}")
-                 .foreachBatch(count_batch)
+                 .format("noop")
                  .option("checkpointLocation", f"{RUN_ROOT}/checkpoints/{safe_name}")
                  .trigger(availableNow=True).start())
         query_start_seconds = time.perf_counter() - build_started
         drain_started = time.perf_counter()
         query.awaitTermination()
         drain_seconds = time.perf_counter() - drain_started
-        batches.sort(key=lambda x: x["batch_id"])
+        # Collect per-batch stats from Spark progress tracking (Spark Connect compatible;
+        # no Python closure is passed to Spark). recentProgress is driver-side only.
+        progress_list = list(query.recentProgress)
+        batches = sorted(
+            [{"batch_id": int(p.get("batchId", i)),
+              "rows": int(p.get("numInputRows", 0)),
+              "seconds": p.get("durationMs", {}).get("triggerExecution", 0) / 1000.0}
+             for i, p in enumerate(progress_list)],
+            key=lambda x: x["batch_id"])
         result = {**row, "status": "OK", "micro_batches": len(batches),
                 "rows_seen": sum(x["rows"] for x in batches),
                 "query_start_seconds": query_start_seconds, "query_stop_seconds": None,
@@ -384,6 +381,19 @@ def bounded_drain(row):
                 "batch_details_json": json.dumps(batches),
                 "error": None}
     except Exception as exc:
+        # Salvage whatever batch progress was recorded before the failure.
+        batches = []
+        if query is not None:
+            try:
+                progress_list = list(query.recentProgress)
+                batches = sorted(
+                    [{"batch_id": int(p.get("batchId", i)),
+                      "rows": int(p.get("numInputRows", 0)),
+                      "seconds": p.get("durationMs", {}).get("triggerExecution", 0) / 1000.0}
+                     for i, p in enumerate(progress_list)],
+                    key=lambda x: x["batch_id"])
+            except Exception:
+                pass
         result = {**row, "status": "ERROR", "micro_batches": len(batches),
                 "rows_seen": sum(x["rows"] for x in batches), "query_start_seconds": None,
                 "query_stop_seconds": None, "drain_seconds": None,
