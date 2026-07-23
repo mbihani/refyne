@@ -1,3 +1,4 @@
+# Databricks notebook source
 """Databricks notebook/script for measuring Consumer-1 S3/Auto Loader drains.
 
 Deploy this file as a Databricks notebook or Python job on the same cluster shape and
@@ -28,7 +29,6 @@ way. Delete the run directory and optional scratch results table when measuremen
 # - Confirm decomposed children still use the ``<parent>_...`` naming convention.
 # - Run on the real pipeline's cluster/runtime because driver, worker, and S3 behavior are unverified.
 
-# Databricks notebook source
 import json
 import math
 import re
