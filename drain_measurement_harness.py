@@ -1,4 +1,3 @@
-# Databricks notebook source
 """Databricks notebook/script for measuring Consumer-1 S3/Auto Loader drains.
 
 Deploy this file as a Databricks notebook or Python job on the same cluster shape and
@@ -29,9 +28,11 @@ way. Delete the run directory and optional scratch results table when measuremen
 # - Confirm decomposed children still use the ``<parent>_...`` naming convention.
 # - Run on the real pipeline's cluster/runtime because driver, worker, and S3 behavior are unverified.
 
+# Databricks notebook source
 import json
 import math
 import re
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -342,6 +343,16 @@ def bounded_drain(row):
     collection = row["collection"]
     safe_name = re.sub(r"[^A-Za-z0-9_]", "_", collection)
     tier = PARENTS[owner_parent(collection)]
+    batches = []
+    batch_lock = threading.Lock()
+
+    def count_batch(df, batch_id):
+        t0 = time.perf_counter()
+        count = df.count()
+        with batch_lock:
+            batches.append({"batch_id": int(batch_id), "rows": count,
+                            "seconds": time.perf_counter() - t0})
+
     query = None
     result = None
     try:
@@ -356,24 +367,15 @@ def bounded_drain(row):
         if row["format"] == "csv":
             reader = reader.option("header", "true")
         df = reader.load(source_glob(collection, row["format"]))
-        df.sparkSession.conf.set("spark.sql.streaming.numRecentProgressUpdates", "1000000")
         query = (df.writeStream.queryName(f"measure_{safe_name}_{RUN_ID}")
-                 .format("noop")
+                 .foreachBatch(count_batch)
                  .option("checkpointLocation", f"{RUN_ROOT}/checkpoints/{safe_name}")
                  .trigger(availableNow=True).start())
         query_start_seconds = time.perf_counter() - build_started
         drain_started = time.perf_counter()
         query.awaitTermination()
         drain_seconds = time.perf_counter() - drain_started
-        # Collect per-batch stats from Spark progress tracking (Spark Connect compatible;
-        # no Python closure is passed to Spark). recentProgress is driver-side only.
-        progress_list = list(query.recentProgress)
-        batches = sorted(
-            [{"batch_id": int(p.get("batchId", i)),
-              "rows": int(p.get("numInputRows", 0)),
-              "seconds": p.get("durationMs", {}).get("triggerExecution", 0) / 1000.0}
-             for i, p in enumerate(progress_list)],
-            key=lambda x: x["batch_id"])
+        batches.sort(key=lambda x: x["batch_id"])
         result = {**row, "status": "OK", "micro_batches": len(batches),
                 "rows_seen": sum(x["rows"] for x in batches),
                 "query_start_seconds": query_start_seconds, "query_stop_seconds": None,
@@ -382,19 +384,6 @@ def bounded_drain(row):
                 "batch_details_json": json.dumps(batches),
                 "error": None}
     except Exception as exc:
-        # Salvage whatever batch progress was recorded before the failure.
-        batches = []
-        if query is not None:
-            try:
-                progress_list = list(query.recentProgress)
-                batches = sorted(
-                    [{"batch_id": int(p.get("batchId", i)),
-                      "rows": int(p.get("numInputRows", 0)),
-                      "seconds": p.get("durationMs", {}).get("triggerExecution", 0) / 1000.0}
-                     for i, p in enumerate(progress_list)],
-                    key=lambda x: x["batch_id"])
-            except Exception:
-                pass
         result = {**row, "status": "ERROR", "micro_batches": len(batches),
                 "rows_seen": sum(x["rows"] for x in batches), "query_start_seconds": None,
                 "query_stop_seconds": None, "drain_seconds": None,
@@ -484,13 +473,18 @@ if WRITE_RESULTS:
                "full_set_wall_seconds": overall_wall_seconds,
                "discovery_seconds": discovery["discovery_seconds"]}
               for r in results]
-    # JSON inference represents all-null LISTING_ONLY fields safely (createDataFrame cannot infer them).
-    # Build the single-column string DataFrame WITHOUT the RDD API (no spark.sparkContext /
-    # parallelize) so this stays Spark-Connect-safe (shared access mode, serverless, DBR Connect);
-    # spark.read.json still does the all-null-safe JSON string inference. Do NOT reintroduce RDD APIs.
-    json_rows = [(json.dumps(x),) for x in output]
-    output_df = spark.read.json(
-        spark.createDataFrame(json_rows, "value string").select("value"))
+    # JSON inference handles all-null LISTING_ONLY fields safely; write to a temp JSONL file in
+    # the volume and read it back so spark.read.json gets a path string — this works on classic
+    # single-user clusters, shared-access clusters, serverless, and DBR Connect alike.
+    tmp_jsonl = f"{RUN_ROOT}/tmp_output_{RUN_ID}.jsonl"
+    jsonl_content = "\n".join(json.dumps(x) for x in output)
+    dbutils.fs.put(tmp_jsonl, jsonl_content, overwrite=True)
+    output_df = spark.read.json(tmp_jsonl)
+    # Null-only runs (LISTING_ONLY) cause JSON to infer *_seconds as LongType; explicitly cast to
+    # DoubleType so every run writes the same schema and mergeSchema never hits a long/double clash.
+    double_cols = [c for c in output_df.columns if c.endswith("_seconds")]
+    for col_name in double_cols:
+        output_df = output_df.withColumn(col_name, F.col(col_name).cast("double"))
     (output_df.withColumn("measured_at_utc", F.to_timestamp("measured_at_utc"))
      .write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(RESULTS_FQN))
     print(f"Appended {len(output)} rows to scratch table {RESULTS_FQN}")
