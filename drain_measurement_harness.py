@@ -356,6 +356,7 @@ def bounded_drain(row):
         if row["format"] == "csv":
             reader = reader.option("header", "true")
         df = reader.load(source_glob(collection, row["format"]))
+        df.sparkSession.conf.set("spark.sql.streaming.numRecentProgressUpdates", "1000000")
         query = (df.writeStream.queryName(f"measure_{safe_name}_{RUN_ID}")
                  .format("noop")
                  .option("checkpointLocation", f"{RUN_ROOT}/checkpoints/{safe_name}")
